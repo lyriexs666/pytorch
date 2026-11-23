@@ -1605,7 +1605,37 @@ def _insert_fn_trace_before_node(  # type: ignore[no-untyped-def]
         return replacements, new_nodes
 
 
-def has_mergeable_all_gather_convert_dtype(n: torch.fx.Node) -> bool:
+def all_gather_merge_fn_coalesced(
+    ag_ins: list[torch.Tensor],
+    group_name: Any,
+    group_size: int,
+    dtype: torch.dtype,  # type: ignore[name-defined]
+    out_dtypes: list[torch.dtype],  # type: ignore[name-defined]
+    rank: int,
+    config: dict[str, Any] | None = None,
+) -> list[torch.Tensor]:
+    """Bucketed AG via NCCL's coalesced API (ncclGroupStart/End).
+
+    Avoids cat-ing inputs into one bucket buffer; instead passes the tensor
+    list directly to all_gather_into_tensor_coalesced for zero-copy batching.
+    """
+    ins_sizes = [ag_in.shape for ag_in in ag_ins]
+    ag_ins_flat = [ag_in.reshape(-1) for ag_in in ag_ins]
+    ag_outs = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default(
+        ag_ins_flat, group_size, group_name, **_config_kwargs(config)
+    )
+    ag_outs = [torch.ops.c10d_functional.wait_tensor(o) for o in ag_outs]
+    return [
+        o.reshape((shape[0] * group_size,) + shape[1:])
+        for o, shape in zip(ag_outs, ins_sizes)
+    ]
+
+
+def has_mergeable_all_gather_convert_dtype(
+    n: torch.fx.Node, mode: str | None = None
+) -> bool:
+    if mode == "coalesced":
+        return False
     node_in = n.args[0]
     return (
         is_all_gather_into_tensor(n)
@@ -1689,6 +1719,7 @@ def process_collective_bucket(
     wait_insertion_point: torch.fx.Node | None = None,
     extra_graph_inps: list[torch.fx.Node] | None = None,
     input_transform: Callable[[torch.fx.Node], torch.fx.Node] | None = None,
+    bucket_mode: str | None = None,
 ) -> tuple[list[torch.fx.Node], dict[torch.fx.Node, torch.fx.Node]]:
     """
     Process a single bucket of collective operation nodes with flexible insertion control.
@@ -1706,6 +1737,9 @@ def process_collective_bucket(
             as an opaque input.
         input_transform: Optional mapping from each collective input to the
             tensor that the merged collective should consume.
+        bucket_mode: Bucketing mode. Controls whether a mergeable dtype cast
+            feeding an all_gather is folded into the merged collective or kept
+            in the graph.
 
     Returns:
         new_nodes: List of all newly inserted nodes
@@ -1723,7 +1757,7 @@ def process_collective_bucket(
 
         # Handle convert_element_type operations (for all_gather)
         node_in = n.args[0]
-        if has_mergeable_all_gather_convert_dtype(n):
+        if has_mergeable_all_gather_convert_dtype(n, bucket_mode):
             # pyrefly: ignore [bad-argument-type]
             ag_node_to_pre_nodes[n].append(node_in)
             # pyrefly: ignore [missing-attribute]
@@ -1984,7 +2018,7 @@ def merge_all_gather_bucket(
     # Choose merge function based on mode
     ag_merge_fn = all_gather_merge_fn_to_trace
     if mode == "coalesced":
-        logger.info("coalesced bucket_mode not supported for all_gather, using default")
+        ag_merge_fn = all_gather_merge_fn_coalesced
     elif mode and "custom_ops" in mode:
         ag_merge_fn = all_gather_merge_fn_to_trace_custom_ops  # type: ignore[assignment]
     ag_merge_fn = functools.partial(ag_merge_fn, config=config)
@@ -2016,6 +2050,7 @@ def merge_all_gather_bucket(
         extra_graph_inps=(
             [group_name] if isinstance(group_name, torch.fx.Node) else None
         ),
+        bucket_mode=mode,
     )
 
 

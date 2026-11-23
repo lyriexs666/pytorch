@@ -516,7 +516,7 @@ bucket_all_gathers_fx: Literal["none", "all", "only_fsdp"] = "none"
 bucket_all_gathers_fx_bucket_size_determinator: Callable[[int], int] | None = None
 
 bucket_all_gathers_bucket_mode: Literal[
-    "default", "custom_ops", "custom_ops_multidtype"
+    "default", "custom_ops", "custom_ops_multidtype", "coalesced"
 ] = "default"
 
 # Fuse duplicate reduce_scatter ops whose waited results are summed via add.
@@ -1608,8 +1608,8 @@ class aten_distributed_optimizations:
     # "custom_ops": temporary bucketing using custom ops to hide parts from inductor
     # "custom_ops_multidtype": same as custom_ops but buckets multiple dtypes
     #     (e.g. bf16 and fp32) into one bucket
-    # "coalesced": zero-copy batching via reduce_scatter_tensor_coalesced
-    #     (reduce_scatter only; all_gather falls back to default)
+    # "coalesced": zero-copy batching via reduce_scatter_tensor_coalesced /
+    #     all_gather_into_tensor_coalesced
     # None means "auto" — the compiler picks the best mode
     bucket_mode: (
         Literal["default", "custom_ops", "custom_ops_multidtype", "coalesced"] | None
