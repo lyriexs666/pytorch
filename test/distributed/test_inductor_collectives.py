@@ -2699,6 +2699,48 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError(f"Expected out to match correct: {out} vs {correct}")
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+    def test_all_gather_bucket_coalesced(self):
+        """Coalesced bucket mode merges all-gathers with
+        all_gather_into_tensor_coalesced instead of cat + a single all_gather."""
+
+        def func(ag_0, ag_1, *, tag, ranks, group_size):
+            group_name = (
+                torch.distributed.distributed_c10d._get_default_group().group_name
+            )
+            ag_0_out = torch.ops._c10d_functional.all_gather_into_tensor(
+                ag_0, group_size, group_name
+            )
+            ag_1_out = torch.ops._c10d_functional.all_gather_into_tensor(
+                ag_1, group_size, group_name
+            )
+            return (
+                torch.ops.c10d_functional.wait_tensor(ag_0_out),
+                torch.ops.c10d_functional.wait_tensor(ag_1_out),
+            )
+
+        inputs = [torch.ones(64, device=self.device) for _ in range(2)]
+        correct = func(*inputs, **self.get_world_trs())
+
+        with torch._inductor.config.patch(
+            {
+                "bucket_all_gathers_fx": "all",
+                "bucket_all_gathers_bucket_mode": "coalesced",
+                "reorder_for_compute_comm_overlap": False,
+            }
+        ):
+            compiled = torch.compile(func)
+            code = run_and_get_triton_code(compiled, *inputs, **self.get_world_trs())
+
+        (
+            FileCheck()
+            .check("= torch.ops._c10d_functional.all_gather_into_tensor_coalesced")
+            .run(code)
+        )
+        out = compiled(*inputs, **self.get_world_trs())
+        if not same(out, correct):
+            raise AssertionError(f"Expected out to match correct: {out} vs {correct}")
+
+    @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_all_gather_bucket_copy_cat_fusion(self):
         """Bucketed all_gather merge uses copy_(cat(...)) which inductor fuses
         into 1 Triton kernel instead of N kernels from _foreach_copy_."""

@@ -676,10 +676,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertIn("reduce_scatter_tensor_coalesced", graph_str)
         self.assertNotIn("cat.default", graph_str)
 
-    def test_all_gather_coalesced_mode_falls_back(self, device):
+    def test_all_gather_coalesced_mode(self, device):
         """
-        Test that 'coalesced' bucket mode falls back to default bucketing
-        for all_gather (coalesced is only supported for reduce_scatter).
+        Test that 'coalesced' bucket mode uses all_gather_into_tensor_coalesced
+        instead of cat + single all_gather.
         """
 
         def func(a, b):
@@ -703,10 +703,56 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             b = torch.ones(4, 4, device=device) * 2
             traced = make_fx(func)(a, b)
 
-        ag1, ag2 = traced.graph.find_nodes(
-            op="call_function",
-            target=torch.ops._c10d_functional.all_gather_into_tensor.default,
+        hiding_annotations = {}
+        collective_info = build_collective_info(traced.graph, hiding_annotations)
+        scheduled = OrderedSet(traced.graph.nodes)
+
+        from torch._inductor.fx_passes.overlap_preserving_bucketer import (
+            OverlapPreservingBucketer,
         )
+
+        bucketer = OverlapPreservingBucketer(
+            traced.graph,
+            collective_info,
+            scheduled,
+            bucket_mode="coalesced",
+        )
+        bucketer.bucket_collectives()
+
+        graph_str = str(traced.graph)
+        self.assertIn("all_gather_into_tensor_coalesced", graph_str)
+        self.assertNotIn("cat.default", graph_str)
+
+    def test_all_gather_coalesced_mode_preserves_dtype_cast(self, device):
+        """
+        Coalesced all-gather gathers the casted tensors directly, so the
+        pre-collective dtype cast must stay in the graph.  Default bucketing
+        instead folds the cast into its copy.
+        """
+
+        def func(a, b):
+            group_name = "0"
+            group_size = 2
+
+            a_cast = a.to(torch.bfloat16)
+            b_cast = b.to(torch.bfloat16)
+
+            ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                a_cast, group_size, group_name
+            )
+            ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                b_cast, group_size, group_name
+            )
+
+            ag1_out = torch.ops._c10d_functional.wait_tensor(ag1)
+            ag2_out = torch.ops._c10d_functional.wait_tensor(ag2)
+
+            return ag1_out.sum() + ag2_out.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
+            traced = make_fx(func)(a, b)
 
         hiding_annotations = {}
         collective_info = build_collective_info(traced.graph, hiding_annotations)
@@ -724,10 +770,16 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
         bucketer.bucket_collectives()
 
-        # Should use default bucketing (cat + single all_gather), not coalesced
-        graph_str = str(traced.graph)
-        self.assertIn("cat.default", graph_str)
-        self.assertNotIn("all_gather_into_tensor_coalesced", graph_str)
+        coalesced = traced.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default,
+        )
+        self.assertEqual(len(coalesced), 1)
+
+        gathered_inputs = coalesced[0].args[0]
+        self.assertEqual(len(gathered_inputs), 2)
+        for gathered_input in gathered_inputs:
+            self.assertEqual(gathered_input.meta["val"].dtype, torch.bfloat16)
 
     def test_reduce_scatter_coalesced_mode_single_rs(self, device):
         """

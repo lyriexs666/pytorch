@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 from collections import Counter, defaultdict
+from functools import partial
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -171,11 +172,11 @@ def _bucket_trace_inputs(
     return inputs
 
 
-def _all_gather_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
+def _all_gather_bucket_trace_inputs(
+    coll_node: fx.Node, mode: str | None = None
+) -> list[fx.Node]:
     node_in: object = coll_node.args[0]
-    # The dtype conversion is erased by the all-gather bucket trace, so anchor
-    # insertion on the tensor that remains as a graph input to the bucket.
-    if has_mergeable_all_gather_convert_dtype(coll_node):
+    if has_mergeable_all_gather_convert_dtype(coll_node, mode):
         if not isinstance(node_in, fx.Node):
             raise AssertionError(
                 f"expected node input to be a Node, got {type(node_in)}"
@@ -335,7 +336,9 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
         replaced_users = {wait: list(wait.users) for wait in waits}
 
         if is_all_gather(first):
-            bucket_trace_inputs = _all_gather_bucket_trace_inputs
+            bucket_trace_inputs = partial(
+                _all_gather_bucket_trace_inputs, mode=self.bucket_mode
+            )
             merge_bucket = merge_all_gather_bucket
             node_type = "bucketed_all_gather"
         elif is_reduce_scatter(first):

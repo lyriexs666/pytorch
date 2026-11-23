@@ -948,7 +948,7 @@ class OverlapPreservingBucketer:
 
         fused_convert_dtypes = []
         for n in old_starts:
-            if has_mergeable_all_gather_convert_dtype(n):
+            if has_mergeable_all_gather_convert_dtype(n, self.bucket_mode):
                 fused_convert_dtypes.append(n.args[0])
 
         # Find where to place the bucketed operations
